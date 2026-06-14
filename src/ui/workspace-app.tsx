@@ -415,20 +415,28 @@ function ToolPayloadView({
 function WorkspacePayload({ card }: { card: ToolResultCard }) {
   const agentsFiles = card.agentsFiles ?? [];
   const skills = card.skills ?? [];
-  const diagnostics = card.skillDiagnostics ?? [];
   const lines = [
     card.workspaceId ? `Workspace: ${card.workspaceId}` : undefined,
     card.root ? `Root: ${card.root}` : undefined,
-    agentsFiles.length > 0
-      ? `AGENTS.md: ${agentsFiles.map((file) => file.path ?? "AGENTS.md").join(", ")}`
-      : "AGENTS.md: none loaded",
+    agentsFiles.length > 0 ? formatAgentsFilesForPayload(agentsFiles) : "AGENTS.md: none loaded",
     skills.length > 0
       ? `Skills: ${skills.map((skill) => skill.name ?? skill.path ?? "unnamed").join(", ")}`
       : "Skills: none",
-    diagnostics.length > 0 ? `Skill diagnostics: ${diagnostics.length}` : undefined,
   ].filter(Boolean);
 
   return <pre className="text-payload open_workspace">{lines.join("\n")}</pre>;
+}
+
+function formatAgentsFilesForPayload(
+  agentsFiles: NonNullable<ToolResultCard["agentsFiles"]>,
+): string {
+  return agentsFiles
+    .map((file) => {
+      const path = file.path ?? "AGENTS.md";
+      const content = file.content?.trim();
+      return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
+    })
+    .join("\n\n");
 }
 
 function FilePayload({
