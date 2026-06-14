@@ -5,7 +5,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   root: resolve(__dirname, "src/ui"),
   plugins: [react()],
-  base: "/mcp-app-assets/",
+  base: "/mcp-app-assets/v/20260531-1/",
   build: {
     outDir: resolve(__dirname, "dist/ui"),
     emptyOutDir: true,

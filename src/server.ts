@@ -28,6 +28,7 @@ import { formatAgentsNotice, WorkspaceRegistry } from "./workspaces.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://pi-on-mcp/workspace-app.html";
+const WORKSPACE_APP_ASSET_VERSION = "20260531-1";
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -74,7 +75,7 @@ function textSummary(content: ToolContent[]): { lines: number; characters: numbe
 }
 
 function assetBaseUrl(config: ServerConfig): string {
-  return `${config.publicBaseUrl.replace(/\/+$/, "")}/mcp-app-assets`;
+  return `${config.publicBaseUrl.replace(/\/+$/, "")}/mcp-app-assets/v/${WORKSPACE_APP_ASSET_VERSION}`;
 }
 
 function workspaceAppHtml(config: ServerConfig): string {
@@ -106,6 +107,13 @@ function appCsp(config: ServerConfig): { resourceDomains: string[]; connectDomai
 
 function uiBuildDirectory(): string {
   return fileURLToPath(new URL("../dist/ui", import.meta.url));
+}
+
+function setAssetHeaders(res: Response): void {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 }
 
 async function assertWorkspaceAppAssets(): Promise<void> {
@@ -848,12 +856,28 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaces = new WorkspaceRegistry(config);
   const results = new ResultStore();
 
+  app.options("/mcp-app-assets/{*asset}", (_req, res) => {
+    setAssetHeaders(res);
+    res.sendStatus(204);
+  });
+
+  app.use(
+    `/mcp-app-assets/v/${WORKSPACE_APP_ASSET_VERSION}`,
+    express.static(uiBuildDirectory(), {
+      immutable: true,
+      maxAge: "1y",
+      fallthrough: false,
+      setHeaders: setAssetHeaders,
+    }),
+  );
+
   app.use(
     "/mcp-app-assets",
     express.static(uiBuildDirectory(), {
       immutable: true,
       maxAge: "1y",
       fallthrough: false,
+      setHeaders: setAssetHeaders,
     }),
   );
 
