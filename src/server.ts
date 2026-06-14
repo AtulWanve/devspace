@@ -17,6 +17,13 @@ import * as z from "zod/v4";
 import { createAutoCommitManager } from "./autocommit/manager.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
+  logEvent,
+  requestIp,
+  requestPath,
+  commandPreview,
+  sessionIdPrefix,
+} from "./logger.js";
+import {
   editFileTool,
   findFilesTool,
   grepFilesTool,
@@ -137,6 +144,18 @@ interface ToolNames {
   shell: "run_shell" | "bash";
 }
 
+interface ToolLogFields {
+  tool: string;
+  workspaceId?: string;
+  path?: string;
+  workingDirectory?: string;
+  command?: string;
+  commandLength?: number;
+  success: boolean;
+  durationMs: number;
+  error?: string;
+}
+
 function toolNamesFor(config: ServerConfig): ToolNames {
   return config.toolNaming === "short"
     ? {
@@ -239,6 +258,31 @@ function sendJsonRpcError(
   });
 }
 
+function requestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
+  return {
+    ip: requestIp(req, config.logging.trustProxy),
+    host: req.header("host"),
+    userAgent: req.header("user-agent"),
+    origin: req.header("origin"),
+    referer: req.header("referer"),
+    contentLength: req.header("content-length"),
+  };
+}
+
+function authFailureReason(req: Request): "missing_bearer_token" | "invalid_bearer_token" {
+  return req.header("authorization") ? "invalid_bearer_token" : "missing_bearer_token";
+}
+
+function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
+  if (!config.logging.toolCalls) return;
+
+  const { command, ...safeFields } = fields;
+  logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
+    ...safeFields,
+    commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
+  });
+}
+
 function contentText(content: ToolContent[]): string {
   return content
     .filter(
@@ -246,6 +290,26 @@ function contentText(content: ToolContent[]): string {
     )
     .map((item) => item.text)
     .join("\n");
+}
+
+function toolErrorPreview(content: ToolContent[]): string | undefined {
+  const text = contentText(content).replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
+}
+
+function logFailedToolResponse(
+  config: ServerConfig,
+  fields: Omit<ToolLogFields, "success" | "durationMs" | "error">,
+  content: ToolContent[],
+  startedAt: number,
+): void {
+  logToolCall(config, {
+    ...fields,
+    success: false,
+    durationMs: Math.round(performance.now() - startedAt),
+    error: toolErrorPreview(content),
+  });
 }
 
 function textBlock(text: string): ToolContent {
@@ -495,6 +559,7 @@ function createMcpServer(
       annotations: { readOnlyHint: true },
     },
     async ({ path, mode, baseRef }) => {
+      const startedAt = performance.now();
       const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
       void autoCommit.initializeWorkspace({
         workspaceId: workspace.id,
@@ -543,6 +608,13 @@ function createMcpServer(
           ].filter(Boolean).join("\n"),
         },
       ];
+      logToolCall(config, {
+        tool: "open_workspace",
+        workspaceId: workspace.id,
+        path: workspace.root,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
 
       return {
         content: resultContent,
@@ -620,6 +692,7 @@ function createMcpServer(
       annotations: { readOnlyHint: true },
     },
     async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const readPath = workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
@@ -631,7 +704,14 @@ function createMcpServer(
         },
       );
 
-      if (response.isError) return response;
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: toolNames.read,
+          workspaceId,
+          path: input.path,
+        }, response.content, startedAt);
+        return response;
+      }
       workspaces.markReadPathLoaded(workspace, readPath);
 
       const summary = {
@@ -639,6 +719,13 @@ function createMcpServer(
         offset: input.offset ?? 1,
         limited: input.limit !== undefined,
       };
+      logToolCall(config, {
+        tool: toolNames.read,
+        workspaceId,
+        path: input.path,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
 
       return {
         ...response,
@@ -679,6 +766,7 @@ function createMcpServer(
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
       const response = await writeFileTool(input, {
@@ -686,7 +774,14 @@ function createMcpServer(
         root: workspace.root,
       });
 
-      if (response.isError) return response;
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: toolNames.write,
+          workspaceId,
+          path: input.path,
+        }, response.content, startedAt);
+        return response;
+      }
 
       const patch = newFilePatch(input.path, input.content);
       const stats = countDiffStats(patch);
@@ -703,6 +798,13 @@ function createMcpServer(
         path: input.path,
         additions: stats.additions,
         removals: stats.removals,
+      });
+      logToolCall(config, {
+        tool: toolNames.write,
+        workspaceId,
+        path: input.path,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
       });
 
       return {
@@ -760,6 +862,7 @@ function createMcpServer(
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
       const response = await editFileTool(input, {
@@ -767,7 +870,14 @@ function createMcpServer(
         root: workspace.root,
       });
 
-      if (response.isError) return response;
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: toolNames.edit,
+          workspaceId,
+          path: input.path,
+        }, response.content, startedAt);
+        return response;
+      }
 
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,
@@ -787,6 +897,13 @@ function createMcpServer(
         additions: stats.additions,
         removals: stats.removals,
         editCount: input.edits.length,
+      });
+      logToolCall(config, {
+        tool: toolNames.edit,
+        workspaceId,
+        path: input.path,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
       });
 
       return {
@@ -837,6 +954,7 @@ function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, since, markReviewed }) => {
+        const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         const review = await reviewCheckpoints.reviewChanges({
           workspaceId,
@@ -846,6 +964,12 @@ function createMcpServer(
         });
 
         const content = [textBlock(review.result)];
+        logToolCall(config, {
+          tool: "review_changes",
+          workspaceId,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
 
         return {
           content,
@@ -894,6 +1018,7 @@ function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
+        const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         if (input.path) workspaces.resolvePath(workspace, input.path);
         const response = await grepFilesTool(input, {
@@ -901,13 +1026,27 @@ function createMcpServer(
           root: workspace.root,
         });
 
-        if (response.isError) return response;
+        if (response.isError) {
+          logFailedToolResponse(config, {
+            tool: toolNames.grep,
+            workspaceId,
+            path: input.path,
+          }, response.content, startedAt);
+          return response;
+        }
 
         const summary = {
           pattern: input.pattern,
           scope: input.path ?? ".",
           ...textSummary(response.content),
         };
+        logToolCall(config, {
+          tool: toolNames.grep,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
 
         return {
           ...response,
@@ -949,6 +1088,7 @@ function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
+        const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         if (input.path) workspaces.resolvePath(workspace, input.path);
         const response = await findFilesTool(input, {
@@ -956,13 +1096,27 @@ function createMcpServer(
           root: workspace.root,
         });
 
-        if (response.isError) return response;
+        if (response.isError) {
+          logFailedToolResponse(config, {
+            tool: toolNames.glob,
+            workspaceId,
+            path: input.path,
+          }, response.content, startedAt);
+          return response;
+        }
 
         const summary = {
           pattern: input.pattern,
           scope: input.path ?? ".",
           ...textSummary(response.content),
         };
+        logToolCall(config, {
+          tool: toolNames.glob,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
 
         return {
           ...response,
@@ -1004,6 +1158,7 @@ function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
+        const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         workspaces.resolvePath(workspace, input.path);
         const response = await listDirectoryTool(input, {
@@ -1011,9 +1166,23 @@ function createMcpServer(
           root: workspace.root,
         });
 
-        if (response.isError) return response;
+        if (response.isError) {
+          logFailedToolResponse(config, {
+            tool: toolNames.ls,
+            workspaceId,
+            path: input.path,
+          }, response.content, startedAt);
+          return response;
+        }
 
         const summary = textSummary(response.content);
+        logToolCall(config, {
+          tool: toolNames.ls,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
 
         return {
           ...response,
@@ -1069,6 +1238,7 @@ function createMcpServer(
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
+      const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
@@ -1079,7 +1249,16 @@ function createMcpServer(
         root: workspace.root,
       });
 
-      if (response.isError) return response;
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: toolNames.shell,
+          workspaceId,
+          workingDirectory: workingDirectory ?? ".",
+          command: input.command,
+          commandLength: input.command.length,
+        }, response.content, startedAt);
+        return response;
+      }
 
       const summary = {
         command: input.command,
@@ -1093,6 +1272,15 @@ function createMcpServer(
         success: true,
         command: input.command,
         workingDirectory: workingDirectory ?? ".",
+      });
+      logToolCall(config, {
+        tool: toolNames.shell,
+        workspaceId,
+        workingDirectory: workingDirectory ?? ".",
+        command: input.command,
+        commandLength: input.command.length,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
       });
 
       return {
@@ -1127,6 +1315,33 @@ export function createServer(config = loadConfig()): RunningServer {
   const autoCommit = createAutoCommitManager({ config: config.autocommit });
   const reviewCheckpoints = createReviewCheckpointManager();
 
+  if (config.logging.trustProxy) {
+    app.set("trust proxy", true);
+  }
+
+  app.use((req, res, next) => {
+    const requestId = randomUUID();
+    const startedAt = performance.now();
+    res.locals.requestId = requestId;
+
+    res.on("finish", () => {
+      const path = requestPath(req);
+      if (!config.logging.requests) return;
+      if (!config.logging.assets && path.startsWith("/mcp-app-assets")) return;
+
+      logEvent(config.logging, "info", "http_request", {
+        requestId,
+        method: req.method,
+        path,
+        status: res.statusCode,
+        durationMs: Math.round(performance.now() - startedAt),
+        ...requestLogFields(req, config),
+      });
+    });
+
+    next();
+  });
+
   app.options("/mcp-app-assets/{*asset}", (_req, res) => {
     setAssetHeaders(res);
     res.sendStatus(204);
@@ -1147,13 +1362,31 @@ export function createServer(config = loadConfig()): RunningServer {
   });
 
   app.all("/mcp", async (req, res) => {
+    const requestId = res.locals.requestId as string | undefined;
+    const sessionId = req.header("mcp-session-id");
+    const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
+
     if (!isAuthorized(req, config)) {
+      logEvent(config.logging, "warn", "auth_denied", {
+        requestId,
+        method: req.method,
+        path: requestPath(req),
+        reason: authFailureReason(req),
+        ...requestLogFields(req, config),
+      });
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
       return;
     }
 
+    logEvent(config.logging, "debug", "mcp_request", {
+      requestId,
+      method: req.method,
+      sessionIdPresent: Boolean(sessionId),
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      isInitialize: initializeRequest,
+    });
+
     try {
-      const sessionId = req.header("mcp-session-id");
       let transport: Transport | undefined;
 
       if (sessionId) {
@@ -1162,17 +1395,27 @@ export function createServer(config = loadConfig()): RunningServer {
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
-      } else if (req.method === "POST" && isInitializeRequest(req.body)) {
+      } else if (initializeRequest) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             if (transport) transports.set(newSessionId, transport);
+            logEvent(config.logging, "info", "mcp_session_created", {
+              requestId,
+              sessionIdPrefix: sessionIdPrefix(newSessionId),
+              ...requestLogFields(req, config),
+            });
           },
         });
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
-          if (closedSessionId) transports.delete(closedSessionId);
+          if (closedSessionId) {
+            transports.delete(closedSessionId);
+            logEvent(config.logging, "info", "mcp_session_closed", {
+              sessionIdPrefix: sessionIdPrefix(closedSessionId),
+            });
+          }
         };
 
         const server = createMcpServer(config, workspaces, autoCommit, reviewCheckpoints);
@@ -1184,7 +1427,10 @@ export function createServer(config = loadConfig()): RunningServer {
 
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
-      console.error("Error handling MCP request", error);
+      logEvent(config.logging, "error", "mcp_request_error", {
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       if (!res.headersSent) {
         sendJsonRpcError(res, 500, -32603, "Internal server error");
       }
@@ -1212,5 +1458,9 @@ if (await isMainModule()) {
     console.log(
       config.authToken ? "auth: bearer token required" : "auth: disabled",
     );
+    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
+    console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
+    console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
   });
 }

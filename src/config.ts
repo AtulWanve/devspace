@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { AutoCommitConfig, AutoCommitProviderId } from "./autocommit/types.js";
+import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 
 export type ToolNamingMode = "legacy" | "short";
 export type WidgetMode = "off" | "changes" | "full";
@@ -23,6 +24,7 @@ export interface ServerConfig {
   skillsEnabled: boolean;
   skillPaths: string[];
   agentDir: string;
+  logging: LoggingConfig;
   autocommit: AutoCommitConfig;
 }
 
@@ -64,6 +66,20 @@ function parseBoolean(value: string | undefined): boolean {
 
 function parseMinimalTools(env: NodeJS.ProcessEnv): boolean {
   return env.DEVSPACE_TOOL_MODE === "minimal" || parseBoolean(env.DEVSPACE_MINIMAL_TOOLS);
+}
+
+function parseLogLevel(value: string | undefined): LogLevel {
+  if (!value || value === "info") return "info";
+  if (["silent", "error", "warn", "debug"].includes(value)) return value as LogLevel;
+
+  throw new Error(`Invalid DEVSPACE_LOG_LEVEL: ${value}`);
+}
+
+function parseLogFormat(value: string | undefined): LogFormat {
+  if (!value || value === "json") return "json";
+  if (value === "pretty") return "pretty";
+
+  throw new Error(`Invalid DEVSPACE_LOG_FORMAT: ${value}`);
 }
 
 function parseList(value: string | undefined): string[] {
@@ -130,6 +146,18 @@ function parseToolNaming(value: string | undefined): ToolNamingMode {
   throw new Error(`Invalid DEVSPACE_TOOL_NAMING: ${value}`);
 }
 
+function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
+  return {
+    level: parseLogLevel(env.DEVSPACE_LOG_LEVEL),
+    format: parseLogFormat(env.DEVSPACE_LOG_FORMAT),
+    requests: env.DEVSPACE_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_REQUESTS),
+    assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
+    toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
+    shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
+    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+  };
+}
+
 function parseWidgetMode(value: string | undefined): WidgetMode {
   if (!value || value === "changes") return "changes";
   if (value === "off" || value === "full") return value;
@@ -165,6 +193,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     skillsEnabled: parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parseList(env.DEVSPACE_SKILL_PATHS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? defaultAgentDir())),
+    logging: parseLoggingConfig(env),
     autocommit: parseAutoCommitConfig(env),
   };
 }
